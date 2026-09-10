@@ -1,9 +1,15 @@
 databases:
   - name: netpulse-db
+    ipAllowList:
+      - source: 0.0.0.0/0
+        description: everywhere
 
 services:
   - type: redis
     name: netpulse-redis
+    ipAllowList:
+      - source: 0.0.0.0/0
+        description: everywhere
 
   - type: web
     name: netpulse-backend

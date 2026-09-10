@@ -12,6 +12,11 @@ load_dotenv(BASE_DIR / '.env')
 SECRET_KEY = 'django-insecure-dummy-key-change-in-production'
 DEBUG = True
 
+# Reverse proxy configuration for Render
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+USE_X_FORWARDED_HOST = True
+USE_X_FORWARDED_PORT = True
+
 def env_list(name: str, default: str = '') -> list[str]:
     return [item.strip() for item in os.environ.get(name, default).split(',') if item.strip()]
 

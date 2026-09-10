@@ -1,0 +1,28 @@
+databases:
+  - name: netpulse-db
+
+services:
+  - type: redis
+    name: netpulse-redis
+
+  - type: web
+    name: netpulse-backend
+    env: python
+    buildCommand: "./build.sh"
+    startCommand: "cd backend && daphne -b 0.0.0.0 -p $PORT core.asgi:application"
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+      - key: USE_REDIS
+        value: "True"
+      - key: ALLOWED_HOSTS
+        value: ".onrender.com"
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: netpulse-redis
+          property: connectionString
+      - key: DATABASE_URL
+        fromDatabase:
+          name: netpulse-db
+          property: connectionString

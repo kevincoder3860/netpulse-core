@@ -137,10 +137,10 @@ CORS_ALLOWED_ORIGINS = env_list(
 )
 CORS_ALLOWED_METHODS = ['DELETE', 'GET', 'OPTIONS', 'PATCH', 'POST', 'PUT']
 CORS_ALLOW_HEADERS = ['*']
-CSRF_TRUSTED_ORIGINS = env_list(
+CSRF_TRUSTED_ORIGINS = os.getenv(
     'CSRF_TRUSTED_ORIGINS',
-    'http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,http://192.168.1.107:5173,http://192.168.1.107:5174,http://192.168.100.8:5173,http://192.168.100.8:8001,http://localhost:8000,http://127.0.0.1:8000'
-)
+    'https://netpulse-backend-i9fv.onrender.com'
+).split(',')
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (

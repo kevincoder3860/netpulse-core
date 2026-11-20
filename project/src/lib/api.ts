@@ -143,14 +143,28 @@ function unwrap<T>(request: Promise<{ data: T }>) {
 
 function apiErrorMessage(error: unknown, fallback: string) {
   if (!axios.isAxiosError(error)) return error instanceof Error ? error.message : fallback;
-  const responseData = error.response?.data as Record<string, unknown> | undefined;
-  if (!responseData) return error.message || fallback;
-  const detail = responseData.detail;
-  if (typeof detail === 'string' && detail) return detail;
-  const fields = Object.entries(responseData)
-    .flatMap(([field, value]) => `${field}: ${Array.isArray(value) ? value.join(', ') : String(value)}`)
-    .join(' ');
-  return fields || error.message || fallback;
+  const formatResponseData = (value: unknown): string => {
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    if (Array.isArray(value)) {
+      return value.map((item) => formatResponseData(item)).filter(Boolean).join(', ');
+    }
+    if (!value || typeof value !== 'object') return '';
+
+    return Object.entries(value as Record<string, unknown>)
+      .map(([key, item]) => {
+        const message = formatResponseData(item);
+        if (!message) return '';
+        return key === 'detail' || key === 'message' || key === 'non_field_errors'
+          ? message
+          : `${key}: ${message}`;
+      })
+      .filter(Boolean)
+      .join('; ');
+  };
+
+  const detail = formatResponseData(error.response?.data);
+  return detail || error.message || fallback;
 }
 
 export const api = {
@@ -187,21 +201,19 @@ export const api = {
       localStorage.setItem('np_refresh', data.refresh);
       return data;
     } catch (error) {
-      if (axios.isAxiosError(error) && !error.response) {
-        const offlineMessage = `The API server at ${API_BASE_URL} is offline or unreachable. Please check your connection and try again.`;
-        alert(offlineMessage);
-        throw new Error(offlineMessage);
-      }
       if (!axios.isAxiosError(error)) throw error;
-      const responseData = error.response?.data as Record<string, unknown> | undefined;
-      const detail = responseData?.detail;
-      const fieldErrors = responseData
-        ? Object.entries(responseData)
-          .filter(([key]) => key !== 'detail')
-          .flatMap(([key, value]) => `${key}: ${Array.isArray(value) ? value.join(', ') : String(value)}`)
-          .join(' ')
-        : '';
-      throw new Error((typeof detail === 'string' && detail) || fieldErrors || 'Unable to create the vendor account.');
+      if (error.response) {
+        const detail = apiErrorMessage(error, 'The server did not provide additional error details.');
+        throw new Error(`Registration failed (HTTP ${error.response.status}): ${detail}`);
+      }
+
+      if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+        throw new Error(`The registration request to ${API_BASE_URL} timed out. Please try again.`);
+      }
+      if (error.code === 'ERR_NETWORK') {
+        throw new Error(`Could not connect to the API at ${API_BASE_URL}. Check your network connection and try again.`);
+      }
+      throw new Error(error.message || 'Unable to create the vendor account.');
     }
   },
   signOut() { localStorage.removeItem('np_access'); localStorage.removeItem('np_refresh'); },

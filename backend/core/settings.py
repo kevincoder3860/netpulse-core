@@ -179,6 +179,7 @@ CORS_ALLOW_ALL_ORIGINS = False
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOWED_ORIGINS = list(dict.fromkeys([
     'https://netpulse-backend-i9fv.onrender.com',
+    'https://netpulse-hotspot.onrender.com',
     'http://localhost:5173',
     'http://127.0.0.1:5173',
     'http://192.168.1.107:5173',
@@ -191,6 +192,7 @@ CORS_ALLOWED_METHODS = ['DELETE', 'GET', 'OPTIONS', 'PATCH', 'POST', 'PUT']
 CORS_ALLOW_HEADERS = ['*']
 CSRF_TRUSTED_ORIGINS = list(dict.fromkeys([
     'https://netpulse-backend-i9fv.onrender.com',
+    'https://netpulse-hotspot.onrender.com',
     'http://localhost:5173',
     'http://localhost:5174',
     'http://127.0.0.1:5173',

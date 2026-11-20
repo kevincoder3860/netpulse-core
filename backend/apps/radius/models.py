@@ -22,6 +22,18 @@ class RadReply(models.Model):
         managed = False
         db_table = 'radreply'
 
+
+class RadUserGroup(models.Model):
+    id = models.AutoField(primary_key=True)
+    username = models.CharField(max_length=64, default='')
+    groupname = models.CharField(max_length=64, default='')
+    priority = models.IntegerField(default=1)
+
+    class Meta:
+        managed = False
+        db_table = 'radusergroup'
+
+
 class RadAcct(models.Model):
     radacctid = models.BigAutoField(primary_key=True)
     acctsessionid = models.CharField(max_length=64, default='')

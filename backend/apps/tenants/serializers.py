@@ -5,10 +5,49 @@ from django.db import transaction
 from rest_framework_simplejwt.tokens import RefreshToken
 
 
-class TenantSerializer(serializers.ModelSerializer):
+class TenantPaystackFieldsSerializer(serializers.ModelSerializer):
+    paystack_secret_key = serializers.CharField(
+        write_only=True,
+        required=False,
+        allow_blank=True,
+        trim_whitespace=True,
+    )
+    paystack_secret_key_set = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Tenant
+        fields = ['billing_email', 'paystack_secret_key', 'paystack_secret_key_set']
+
+    def create(self, validated_data):
+        secret_key = validated_data.pop('paystack_secret_key', '')
+        tenant = super().create(validated_data)
+        if secret_key:
+            tenant.set_paystack_secret_key(secret_key)
+            tenant.save(update_fields=['paystack_secret_key', 'updated_at'])
+        return tenant
+
+    def update(self, instance, validated_data):
+        secret_key = validated_data.pop('paystack_secret_key', '')
+        tenant = super().update(instance, validated_data)
+        if secret_key:
+            tenant.set_paystack_secret_key(secret_key)
+            tenant.save(update_fields=['paystack_secret_key', 'updated_at'])
+        return tenant
+
+
+class TenantSerializer(TenantPaystackFieldsSerializer):
     class Meta:
         model = Tenant
         fields = '__all__'
+
+
+class TenantBrandingSerializer(TenantPaystackFieldsSerializer):
+    class Meta:
+        model = Tenant
+        fields = [
+            'logo_url', 'brand_color', 'welcome_headline', 'terms_of_service',
+            'billing_email', 'paystack_secret_key', 'paystack_secret_key_set',
+        ]
 
 
 class RegisterSerializer(serializers.Serializer):

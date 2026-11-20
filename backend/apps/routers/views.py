@@ -1,19 +1,41 @@
-from rest_framework import serializers, status, viewsets
+from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework import status
 from rest_framework.permissions import AllowAny
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import SAFE_METHODS
-from django.db import DatabaseError
 import logging
 import socket
+
 from django.utils import timezone
+from django.db import OperationalError
 
 from .models import NAS
 from .serializers import NASSerializer
-from core.permissions import HasStaffPermission, IsSuperAdminOrVendor, IsVendorManager, tenant_for_user
-from .services import RouterConnectionError, fetch_router_telemetry, ping_router_with_credentials, update_router_health, provision_mikrotik_router
+from core.permissions import (
+    HasStaffPermission, IsCustomer, IsSuperAdminOrVendor, IsVendorManager,
+    is_superadmin_user, tenant_for_user,
+)
+from .services import (
+    RouterConnectionError, fetch_router_metrics, update_router_health,
+)
 
 logger = logging.getLogger(__name__)
+
+def _database_error_response(exc, *, operation):
+    is_busy = 'locked' in str(exc).lower() or 'busy' in str(exc).lower()
+    code = 'DATABASE_BUSY' if is_busy else 'DATABASE_UNAVAILABLE'
+    detail = (
+        'Router data is temporarily unavailable because the database is busy.'
+        if is_busy
+        else 'Router data is temporarily unavailable.'
+    )
+    logger.warning('Router %s failed with %s: %s', operation, code, exc)
+    return Response(
+        {'detail': detail, 'code': code},
+        status=status.HTTP_503_SERVICE_UNAVAILABLE,
+    )
 
 
 class RouterViewSet(viewsets.ModelViewSet):
@@ -23,20 +45,44 @@ class RouterViewSet(viewsets.ModelViewSet):
 
     def get_permissions(self):
         if self.request.method in SAFE_METHODS:
+            if getattr(self.request.user, 'customer_profile', None):
+                return [IsCustomer()]
             return [HasStaffPermission('MANAGER', 'TECHNICIAN', 'CASHIER')]
         return [IsVendorManager()]
 
     def get_queryset(self):
         queryset = super().get_queryset()
         tenant_id = self.request.query_params.get('tenant_id')
-        if self.request.user.is_superadmin:
+        if is_superadmin_user(self.request.user):
             return queryset.filter(tenant_id=tenant_id) if tenant_id else queryset
         tenant = tenant_for_user(self.request.user)
         if tenant:
             return queryset.filter(tenant_id=tenant.id)
         return queryset.none()
 
-    def _update_router_and_ping(self, request, *, partial):
+    def perform_create(self, serializer):
+        tenant = tenant_for_user(self.request.user)
+        if tenant:
+            serializer.save(tenant=tenant)
+            return
+        if not is_superadmin_user(self.request.user):
+            raise PermissionDenied('Your account is not associated with a vendor tenant.')
+        serializer.save()
+
+    def list(self, request, *args, **kwargs):
+        try:
+            routers = list(self.filter_queryset(self.get_queryset()))
+        except OperationalError as exc:
+            return _database_error_response(exc, operation='list query')
+
+        page = self.paginate_queryset(routers)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = self.get_serializer(routers, many=True)
+        return Response(serializer.data)
+
+    def _update_router(self, request, *, partial):
         router = self.get_object()
         payload = request.data.copy()
         if payload.get('api_ip') and not payload.get('nas_ip'):
@@ -44,40 +90,14 @@ class RouterViewSet(viewsets.ModelViewSet):
         payload.pop('api_ip', None)
         serializer = self.get_serializer(router, data=payload, partial=partial)
         serializer.is_valid(raise_exception=True)
-        api_ip = payload.get('api_ip') or payload.get('nas_ip')
-        api_user = payload.get('api_username')
-        api_pass = payload.get('api_password')
-        api_port = payload.get('api_port')
-        try:
-            host, port, username, password = ping_router_with_credentials(
-                router,
-                api_ip=api_ip,
-                api_port=api_port,
-                api_username=api_user,
-                api_password=api_pass,
-            )
-            router = serializer.save(
-                nas_ip=host,
-                api_port=port,
-                api_username=username,
-                api_password=password,
-                is_online=True,
-                status='online',
-                last_ping=timezone.now(),
-            )
-            return Response(self.get_serializer(router).data, status=status.HTTP_200_OK)
-        except Exception as exc:
-            router.is_online = False
-            router.status = 'offline'
-            router.save(update_fields=['is_online', 'status', 'updated_at'])
-            code = getattr(exc, 'code', 'ROUTER_UNREACHABLE')
-            return Response({'ok': False, 'success': False, 'message': str(exc), 'code': code, 'is_online': False}, status=status.HTTP_400_BAD_REQUEST)
+        router = serializer.save()
+        return Response(self.get_serializer(router).data, status=status.HTTP_200_OK)
 
     def update(self, request, *args, **kwargs):
-        return self._update_router_and_ping(request, partial=False)
+        return self._update_router(request, partial=False)
 
     def partial_update(self, request, *args, **kwargs):
-        return self._update_router_and_ping(request, partial=True)
+        return self._update_router(request, partial=True)
 
     @action(detail=True, methods=['get'])
     def config_script(self, request, pk=None):
@@ -94,86 +114,119 @@ class RouterViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def provision(self, request, pk=None):
         nas = self.get_object()
-        connection = None
 
-        def mark_offline():
-            nas.is_online = False
-            nas.status = 'offline'
-            nas.save()
-
+        target_ip = request.data.get('api_ip') or request.data.get('nas_ip') or nas.nas_ip
+        target_user = request.data.get('api_username') or nas.api_username or 'netpulse_admin'
+        target_pass = request.data.get('api_password') or nas.api_password or '123'
         try:
-            target_ip = request.data.get('nas_ip') or request.data.get('api_ip') or nas.nas_ip
-            target_user = request.data.get('api_username') or nas.api_username or 'netpulse_admin'
-            target_pass = request.data.get('api_password') or nas.api_password or '123'
             target_port = int(request.data.get('api_port') or nas.api_port or 8728)
-            if not target_ip:
-                raise ValueError('Router IP is required.')
-
-            serializer = NASSerializer(instance=nas, data={
-                'nas_ip': target_ip,
-                'api_port': target_port,
-                'api_username': target_user,
-                'api_password': target_pass,
-            }, partial=True)
-            serializer.is_valid(raise_exception=True)
-
-            from librouteros import connect
-            connection = connect(
-                host=target_ip,
-                username=target_user,
-                password=target_pass,
-                port=target_port,
-            )
-
-            serializer.save(
-                nas_ip=target_ip,
-                api_port=target_port,
-                api_username=target_user,
-                api_password=target_pass,
-                is_online=True,
-                status='online',
-                last_ping=timezone.now(),
-            )
-
+        except (TypeError, ValueError):
             return Response(
-                {'status': 'success', 'message': 'Successfully connected and updated router status to Online!', 'data': NASSerializer(nas).data},
-                status=status.HTTP_200_OK,
-            )
-        except serializers.ValidationError as exc:
-            logger.warning('Router provisioning validation failed for NAS %s: %s', nas.pk, exc.detail)
-            return Response({'status': 'failed', 'message': str(exc.detail), 'code': 'VALIDATION_FAILED'}, status=status.HTTP_400_BAD_REQUEST)
-        except RouterConnectionError as exc:
-            mark_offline()
-            return Response(
-                {'success': False, 'is_online': False, 'status': 'offline', 'message': 'Router is unreachable and marked as offline.'},
-                status=status.HTTP_200_OK,
-            )
-        except (TimeoutError, ConnectionError, OSError) as exc:
-            mark_offline()
-            logger.warning('Router %s is unreachable: %s', nas.pk, exc)
-            return Response(
-                {'success': False, 'is_online': False, 'status': 'offline', 'message': 'Router is unreachable and marked as offline.'},
-                status=status.HTTP_200_OK,
-            )
-        except (DatabaseError, ValueError, TypeError) as exc:
-            logger.exception('Router provisioning failure for NAS %s', nas.pk)
-            return Response(
-                {'ok': False, 'success': False, 'message': str(exc), 'code': 'PROVISION_FAILED'},
+                {'ok': False, 'success': False, 'message': 'Router API port must be a valid integer.', 'code': 'INVALID_ROUTER_PORT'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        except Exception as exc:
-            mark_offline()
-            logger.exception('Unexpected router provisioning failure for NAS %s', nas.pk)
+
+        radius_ip = request.data.get('radius_ip') or request.data.get('radius_server_ip') or request.data.get('address') or '192.168.56.1'
+        if not isinstance(radius_ip, str) or not radius_ip.strip():
             return Response(
-                {'success': False, 'is_online': False, 'status': 'offline', 'message': 'Router is unreachable and marked as offline.'},
+                {'ok': False, 'message': 'RADIUS Server IP (address) is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer_data = {
+            'nas_ip': target_ip,
+            'api_port': target_port,
+            'api_username': target_user,
+            'api_password': target_pass,
+        }
+
+        serializer = NASSerializer(instance=nas, data=serializer_data, partial=True)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            logger.debug('Attempting router provisioning connection to %s:%s', target_ip, target_port)
+            from librouteros import connect
+
+            connection = connect(
+                host=request.data.get('nas_ip') or target_ip,
+                username=request.data.get('api_username') or target_user,
+                password=request.data.get('api_password') or target_pass,
+                port=target_port,
+                timeout=5.0,
+            )
+            connection.close()
+
+            nas.nas_ip = request.data.get('nas_ip') or target_ip
+            nas.api_port = target_port
+            nas.api_username = request.data.get('api_username') or target_user
+            nas.api_password = request.data.get('api_password') or target_pass
+            nas.is_online = True
+            nas.status = 'online'
+            nas.last_ping = timezone.now()
+            nas.save(update_fields=['nas_ip', 'api_port', 'api_username', 'api_password', 'is_online', 'status', 'last_ping', 'updated_at'])
+
+            serializer = NASSerializer(nas)
+
+            return Response(
+                {'status': 'success', 'message': 'Successfully connected and updated router status to Online!', 'data': serializer.data},
                 status=status.HTTP_200_OK,
             )
-        finally:
-            if connection is not None:
-                try:
-                    connection.close()
-                except Exception:
-                    logger.warning('Unable to close router connection for NAS %s', nas.pk, exc_info=True)
+        except (TimeoutError, socket.timeout) as exc:
+            logger.warning('Router provisioning timed out for NAS %s at %s:%s: %s', nas.pk, target_ip, target_port, exc)
+            nas.is_online = False
+            nas.status = 'offline'
+            nas.save(update_fields=['is_online', 'status', 'updated_at'])
+            return Response(
+                {
+                    'ok': False,
+                    'success': False,
+                    'message': 'Router connection timed out. Please check IP and port.',
+                    'code': 'ROUTER_CONNECTION_TIMEOUT',
+                    'is_online': False,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except RouterConnectionError as exc:
+            return Response(
+                {'ok': False, 'success': False, 'message': str(exc), 'code': exc.code},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except OSError as exc:
+            logger.warning('Router provisioning connection failed for NAS %s at %s:%s: %s', nas.pk, target_ip, target_port, exc)
+            nas.is_online = False
+            nas.status = 'offline'
+            nas.save(update_fields=['is_online', 'status', 'updated_at'])
+            return Response(
+                {'ok': False, 'success': False, 'message': 'Unable to connect to the router. Please check IP, port, and credentials.', 'code': 'ROUTER_CONNECTION_FAILED', 'is_online': False},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception:  # Keep provisioning failures from leaking as unhandled 500 responses.
+            logger.exception('Unexpected router provisioning failure for NAS %s', nas.pk)
+            return Response(
+                {'ok': False, 'success': False, 'message': 'Router provisioning failed. Please check the router settings and try again.', 'code': 'PROVISION_FAILED'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    @action(detail=True, methods=['get'], url_path='metrics')
+    def metrics(self, request, pk=None):
+        router = self.get_object()
+        try:
+            return Response(fetch_router_metrics(router))
+        except RouterConnectionError as exc:
+            logger.warning('Metrics request failed for router %s: %s', router.pk, exc)
+            return Response(
+                {'detail': str(exc), 'code': exc.code},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        except Exception:
+            logger.exception('Unexpected metrics failure for router %s', router.pk)
+            return Response(
+                {
+                    'detail': 'Unable to retrieve live metrics from the router.',
+                    'code': 'ROUTER_METRICS_FAILED',
+                },
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
 
     @action(detail=True, methods=['post'])
     def reboot(self, request, pk=None):
@@ -184,81 +237,12 @@ class RouterViewSet(viewsets.ModelViewSet):
     def health_check(self, request, pk=None):
         nas = self.get_object()
         try:
-            with socket.create_connection((nas.nas_ip or nas.nasname, nas.api_port or 8728), timeout=2):
-                pass
-        except (OSError, TimeoutError, ValueError):
-            nas.is_online = False
-            nas.status = 'offline'
-            nas.save(update_fields=['is_online', 'status', 'updated_at'])
-            return Response({
-                'is_online': False,
-                'status': 'offline',
-                'telemetry': None,
-                'message': 'Router offline',
-            }, status=status.HTTP_200_OK)
-        result = update_router_health(nas, timeout=2.0)
-        nas.refresh_from_db(fields=['is_online', 'status', 'last_ping'])
-        return Response({
-            'router_id': nas.id,
-            'is_online': nas.is_online,
-            'status': nas.status,
-            'telemetry': None,
-            'last_ping': nas.last_ping,
-            'code': result['code'],
-            'message': result['message'],
-        }, status=status.HTTP_200_OK)
+            result = update_router_health(nas, timeout=5.0)
+            nas.refresh_from_db(fields=['is_online', 'last_ping'])
+        except OperationalError as exc:
+            return _database_error_response(exc, operation='health check')
+        return Response({'router_id': nas.id, 'is_online': nas.is_online, 'last_ping': nas.last_ping, 'code': result['code'], 'message': result['message']})
 
-    @action(detail=False, methods=['get'])
-    def stats(self, request):
-        routers = self.get_queryset()
-        total = routers.count()
-        online = routers.filter(is_online=True).count()
-        return Response({
-            'total_routers': total,
-            'online_routers': online,
-            'offline_routers': total - online,
-        }, status=status.HTTP_200_OK)
-
-    @action(detail=True, methods=['get'])
-    def telemetry(self, request, pk=None):
-        router = self.get_object()
-        host = (router.nas_ip or router.nasname or '').strip()
-        port = router.api_port or 8728
-        try:
-            with socket.create_connection((host, port), timeout=2):
-                pass
-        except (OSError, TimeoutError, ValueError):
-            router.is_online = False
-            router.status = 'offline'
-            router.save(update_fields=['is_online', 'status', 'updated_at'])
-            return Response({
-                'is_online': False,
-                'status': 'offline',
-                'telemetry': None,
-                'message': 'Router offline',
-            }, status=status.HTTP_200_OK)
-
-        try:
-            telemetry = fetch_router_telemetry(router)
-        except Exception:
-            router.is_online = False
-            router.status = 'offline'
-            router.save(update_fields=['is_online', 'status', 'updated_at'])
-            return Response({
-                'is_online': False,
-                'status': 'offline',
-                'telemetry': None,
-            }, status=status.HTTP_200_OK)
-
-        router.is_online = True
-        router.status = 'online'
-        router.last_ping = timezone.now()
-        router.save(update_fields=['is_online', 'status', 'last_ping', 'updated_at'])
-        return Response({
-            'is_online': True,
-            'status': 'online',
-            'telemetry': telemetry,
-        }, status=status.HTTP_200_OK)
 
 class PortalConfigView(viewsets.ViewSet):
     permission_classes = [AllowAny]

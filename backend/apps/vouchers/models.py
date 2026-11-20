@@ -3,6 +3,7 @@ from django.utils import timezone
 from apps.tenants.models import Tenant
 from apps.routers.models import NAS
 from apps.billing.models import HotspotPlan
+from apps.billing.models import Transaction
 
 
 class Voucher(models.Model):
@@ -27,6 +28,13 @@ class Recharge(models.Model):
     mac_address = models.CharField(max_length=17, blank=True, default='')
     plan = models.ForeignKey(HotspotPlan, on_delete=models.SET_NULL, null=True, blank=True)
     router = models.ForeignKey(NAS, on_delete=models.SET_NULL, null=True, blank=True)
+    transaction = models.OneToOneField(
+        Transaction,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='recharge',
+    )
     method = models.CharField(max_length=20, choices=METHOD_CHOICES, default='SYSTEM')
     expires_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

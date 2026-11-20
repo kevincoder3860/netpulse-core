@@ -1,6 +1,10 @@
 from django.db import models
 from django.conf import settings
+import base64
+import hashlib
+import os
 import uuid
+from cryptography.fernet import Fernet, InvalidToken
 
 class Tenant(models.Model):
     class Status(models.TextChoices):
@@ -12,6 +16,8 @@ class Tenant(models.Model):
     business_name = models.CharField(max_length=255)
     email = models.EmailField(unique=True)
     phone_number = models.CharField(max_length=20)
+    billing_email = models.EmailField(blank=True, default='')
+    paystack_secret_key = models.TextField(blank=True, default='')
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.ACTIVE)
     status_reason = models.TextField(blank=True, default='')
     status_changed_at = models.DateTimeField(null=True, blank=True)
@@ -24,6 +30,33 @@ class Tenant(models.Model):
     terms_of_service = models.TextField(blank=True, default='By connecting you agree to our terms of service.')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    @staticmethod
+    def _paystack_cipher():
+        key_material = (
+            os.environ.get('PAYSTACK_CREDENTIALS_ENCRYPTION_KEY', '').strip()
+            or settings.SECRET_KEY
+        )
+        key = base64.urlsafe_b64encode(hashlib.sha256(key_material.encode()).digest())
+        return Fernet(key)
+
+    def set_paystack_secret_key(self, value):
+        if value:
+            self.paystack_secret_key = self._paystack_cipher().encrypt(value.encode()).decode()
+
+    def get_paystack_secret_key(self):
+        if not self.paystack_secret_key:
+            return ''
+        try:
+            return self._paystack_cipher().decrypt(self.paystack_secret_key.encode()).decode()
+        except InvalidToken:
+            raise ValueError(
+                'Saved Paystack credentials cannot be decrypted. Re-enter the credentials or restore the encryption key.'
+            ) from None
+
+    @property
+    def paystack_secret_key_set(self):
+        return bool(self.paystack_secret_key)
 
     def __str__(self):
         return self.business_name

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import type { ReactNode } from 'react';
 import { api, type AnalyticsData, type RechargeRecord, type VoucherRecord } from '@/lib/api';
 import { useTelemetry } from '@/hooks/useTelemetry';
@@ -71,13 +71,7 @@ export default function HotspotOperations({ tenant }: Props) {
   }));
   const chart = liveChart.length > 0 ? liveChart : fallbackChart;
 
-  const healthSource = telemetryData ?? {
-    server_cpu: analytics.health.server_cpu,
-    mikrotik_cpu: analytics.health.mikrotik_cpu,
-    memory: analytics.health.memory,
-    disk: analytics.health.disk,
-    router_memory: analytics.health.router_memory,
-  };
+  const healthSource = telemetryData?.health ?? analytics.health;
   const healthMeters = [
     { label: 'Server CPU', value: healthSource.server_cpu },
     { label: 'MikroTik CPU', value: healthSource.mikrotik_cpu },

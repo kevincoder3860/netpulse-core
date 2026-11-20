@@ -10,6 +10,7 @@ from asgiref.sync import sync_to_async
 from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncWebsocketConsumer
 from django.contrib.auth import get_user_model
+from django.db import OperationalError
 from django.db.models import Sum
 from django.utils import timezone
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
@@ -23,7 +24,7 @@ from core.permissions import tenant_for_user
 logger = logging.getLogger(__name__)
 User = get_user_model()
 
-STREAM_INTERVAL_SECONDS = 3.5
+STREAM_INTERVAL_SECONDS = 10
 DISK_ROOT = os.path.abspath(os.sep)
 
 
@@ -212,7 +213,7 @@ class TelemetryConsumer(AsyncWebsocketConsumer):
 
     async def stream_telemetry(self):
         """Emit metrics while keep_streaming is True; never crash the ASGI worker."""
-        collect = sync_to_async(_tenant_metrics_sync, thread_sensitive=True)
+        collect = database_sync_to_async(_tenant_metrics_sync)
         fallback = sync_to_async(_fallback_payload, thread_sensitive=True)
 
         try:
@@ -220,6 +221,16 @@ class TelemetryConsumer(AsyncWebsocketConsumer):
                 payload = None
                 try:
                     payload = await collect(self.tenant_id)
+                except OperationalError as exc:
+                    logger.warning(
+                        'Telemetry database query failed for tenant %s; sending host fallback: %s',
+                        self.tenant_id,
+                        exc,
+                    )
+                    try:
+                        payload = await fallback()
+                    except Exception:
+                        logger.exception('Telemetry fallback also failed for tenant %s', self.tenant_id)
                 except Exception:
                     logger.exception(
                         'Telemetry metric collection failed for tenant %s — sending host fallback',

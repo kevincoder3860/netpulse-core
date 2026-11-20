@@ -1,11 +1,19 @@
 from rest_framework import viewsets
-from core.permissions import IsSuperAdminOrVendor, tenant_for_user
+from core.permissions import (
+    IsSuperAdminOrVendor, IsVendorManager, IsVendorPlanViewer, tenant_for_user,
+)
 from .models import BurstProfile, FUPProfile
 from .serializers import BurstProfileSerializer, FUPProfileSerializer
 
 
 class ScopedViewSet(viewsets.ModelViewSet):
     permission_classes = [IsSuperAdminOrVendor]
+
+    def get_permissions(self):
+        if self.action in ('list', 'retrieve'):
+            return [IsVendorPlanViewer()]
+        return [IsVendorManager()]
+
     def get_queryset(self):
         queryset = super().get_queryset()
         if self.request.user.is_superadmin:

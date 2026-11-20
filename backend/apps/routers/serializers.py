@@ -14,7 +14,7 @@ class NASSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'tenant', 'nasname', 'shortname', 'nas_ip', 'ip_address', 'mac_address', 'secret',
             'api_port', 'api_username', 'api_password', 'radius_server_ip', 'shared_secret',
-            'type', 'is_online', 'status', 'last_ping', 'last_provisioned_at', 'created_at', 'updated_at'
+            'type', 'is_online', 'status', 'last_ping', 'last_seen', 'last_provisioned_at', 'created_at', 'updated_at'
         ]
 
     def validate_nas_ip(self, value):
@@ -41,7 +41,16 @@ class NASSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, attrs):
-        tenant = attrs.get('tenant') or getattr(self.instance, 'tenant', None)
+        tenant = attrs.get('tenant')
+        if (
+            self.instance is not None
+            and tenant is not None
+            and tenant.pk != self.instance.tenant_id
+        ):
+            raise serializers.ValidationError({
+                'tenant': 'A router cannot be reassigned to another vendor.'
+            })
+
         nasname = attrs.get('nasname')
         if nasname is None and self.instance is not None:
             return attrs
@@ -67,6 +76,7 @@ class NASSerializer(serializers.ModelSerializer):
 
         nasname = validated_data['nasname']
         router, _ = NAS.objects.update_or_create(
+            tenant=validated_data['tenant'],
             nasname=nasname,
             defaults=validated_data,
         )

@@ -4,12 +4,18 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.permissions import AllowAny
 from rest_framework import status
+from datetime import timedelta
 from django.contrib.auth import get_user_model
+from django.db.models import Sum
 from django.utils import timezone
 from rest_framework_simplejwt.tokens import AccessToken
 from .models import AuditLog, Tenant, TenantStaff, TenantUser
-from .serializers import StaffInviteSerializer, StaffSerializer, TenantSerializer, RegisterSerializer
-from .permissions import IsSuperAdmin, IsVendorManager, IsVendorMember, IsVendorOwner
+from .serializers import (
+    RegisterSerializer, StaffInviteSerializer, StaffSerializer,
+    TenantBrandingSerializer, TenantSerializer,
+)
+from .permissions import IsSuperAdmin, IsVendorMember, IsVendorOwner
+from core.permissions import IsCustomer, is_superadmin_user
 
 
 class RegisterView(APIView):
@@ -27,19 +33,45 @@ class TenantViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_permissions(self):
+        user = self.request.user
+        if is_superadmin_user(user):
+            return [IsSuperAdmin()]
         profile = getattr(self.request.user, 'tenant_profile', None)
         if profile and profile.role == TenantUser.Role.VENDOR:
-            return [IsVendorOwner()]
-        return [IsSuperAdmin()] if self.request.method != 'GET' or not getattr(self.request.user, 'staff_profile', None) else [IsVendorMember()]
+            if self.action in ('list', 'retrieve', 'partial_update'):
+                return [IsVendorOwner()]
+            return [IsSuperAdmin()]
+        if getattr(user, 'customer_profile', None):
+            return [IsCustomer()] if self.action in ('list', 'retrieve') else [IsSuperAdmin()]
+        staff = getattr(user, 'staff_profile', None)
+        if staff:
+            return [IsVendorMember()] if self.action in ('list', 'retrieve') else [IsSuperAdmin()]
+        return [IsSuperAdmin()]
+
+    def get_serializer_class(self):
+        profile = getattr(self.request.user, 'tenant_profile', None)
+        if (
+            profile
+            and profile.role == TenantUser.Role.VENDOR
+            and self.action == 'partial_update'
+        ):
+            return TenantBrandingSerializer
+        return TenantSerializer
 
     def get_queryset(self):
+        user = self.request.user
+        if is_superadmin_user(user):
+            return self.queryset
         profile = getattr(self.request.user, 'tenant_profile', None)
-        if profile and profile.role == 'VENDOR':
+        if profile and profile.role == TenantUser.Role.VENDOR:
             return self.queryset.filter(id=profile.tenant_id)
-        staff = getattr(self.request.user, 'staff_profile', None)
-        if staff:
+        staff = getattr(user, 'staff_profile', None)
+        if staff and staff.is_active:
             return self.queryset.filter(id=staff.tenant_id)
-        return self.queryset
+        customer = getattr(user, 'customer_profile', None)
+        if customer and not profile and not staff:
+            return self.queryset.filter(id=customer.tenant_id)
+        return self.queryset.none()
 
 
 class VendorStaffView(APIView):
@@ -105,15 +137,23 @@ class SuperAdminMetricsView(APIView):
     permission_classes = [IsSuperAdmin]
 
     def get(self, request):
-        # Placeholder for metrics
-        data = {
-            "revenue": 50000,
-            "mrr": 5000,
-            "active_vendors": 12,
-            "total_routers": 45,
-            "platform_commission": 5000
-        }
-        return Response(data)
+        from apps.billing.models import Transaction
+        from apps.routers.models import NAS
+
+        completed = Transaction.objects.filter(status='COMPLETED')
+        month_start = timezone.now() - timedelta(days=30)
+        all_totals = completed.aggregate(
+            revenue=Sum('gross_amount'),
+            platform_commission=Sum('platform_fee'),
+        )
+        mrr = completed.filter(created_at__gte=month_start).aggregate(total=Sum('gross_amount'))['total'] or 0
+        return Response({
+            'revenue': float(all_totals['revenue'] or 0),
+            'mrr': float(mrr),
+            'active_vendors': Tenant.objects.filter(status=Tenant.Status.ACTIVE).count(),
+            'total_routers': NAS.objects.count(),
+            'platform_commission': float(all_totals['platform_commission'] or 0),
+        })
 
 class VendorDashboardView(APIView):
     permission_classes = [IsVendorMember]
@@ -122,18 +162,25 @@ class VendorDashboardView(APIView):
         profile = getattr(request.user, 'tenant_profile', None)
         staff = getattr(request.user, 'staff_profile', None)
         tenant_id = str(profile.tenant_id if profile else staff.tenant_id)
-        transactions = []
-        routers = []
+        from apps.billing.models import Transaction
+        from apps.routers.models import NAS
+
+        recent_transactions = []
+        routers = NAS.objects.none()
         if tenant_id:
-            from apps.billing.models import Transaction
-            from apps.routers.models import NAS
-            transactions = Transaction.objects.filter(tenant_id=tenant_id).order_by('-created_at')[:100]
+            today = timezone.localdate()
+            transactions = Transaction.objects.filter(tenant_id=tenant_id)
+            recent_transactions = transactions.order_by('-created_at')[:10]
             routers = NAS.objects.filter(tenant_id=tenant_id)
-        total = sum((transaction.gross_amount for transaction in transactions), 0)
-        net = sum((transaction.vendor_net_amount for transaction in transactions), 0)
+            daily = transactions.filter(status='COMPLETED', created_at__date=today).aggregate(
+                revenue=Sum('gross_amount'),
+                net=Sum('vendor_net_amount'),
+            )
+        else:
+            daily = {'revenue': 0, 'net': 0}
         data = {
-            "daily_revenue": total,
-            "net_earnings": net,
+            "daily_revenue": float(daily['revenue'] or 0),
+            "net_earnings": float(daily['net'] or 0),
             "active_routers": routers.filter(is_online=True).count(),
             "total_routers": routers.count(),
             "recent_transactions": [
@@ -146,7 +193,7 @@ class VendorDashboardView(APIView):
                     'payment_method': transaction.payment_method,
                     'created_at': transaction.created_at,
                 }
-                for transaction in transactions
+                for transaction in recent_transactions
             ],
         }
         return Response(data)

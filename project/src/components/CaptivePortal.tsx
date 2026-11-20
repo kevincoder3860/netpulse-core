@@ -1,9 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
 import { api } from '@/lib/api';
 import { useToast } from '@/components/Toast';
+import { submitHotspotLogin } from '@/lib/hotspot';
 import {
   formatCurrency, formatDuration, formatSpeed,
-  generateSessionToken,
 } from '@/lib/utils';
 import type { Tenant, HotspotPlan } from '@/lib/types';
 import {
@@ -19,15 +19,25 @@ type PortalStage = 'packages' | 'checkout' | 'processing' | 'active';
 
 export default function CaptivePortal({ tenant }: CaptivePortalProps) {
   const { toast } = useToast();
+  const hotspotParams = new URLSearchParams(window.location.search);
+  const customerMac = hotspotParams.get('mac')?.trim() || '';
+  const hotspotLoginUrl = hotspotParams.get('link-login-only')
+    || hotspotParams.get('link-login')
+    || '';
+  const hotspotDestination = hotspotParams.get('dst')
+    || hotspotParams.get('link-orig')
+    || '';
   const [plans, setPlans] = useState<HotspotPlan[]>([]);
   const [stage, setStage] = useState<PortalStage>('packages');
   const [selectedPlan, setSelectedPlan] = useState<HotspotPlan | null>(null);
   const [loading, setLoading] = useState(true);
   const [processing, setProcessing] = useState(false);
-  const [sessionToken, setSessionToken] = useState('');
+  const [hotspotCredentials, setHotspotCredentials] = useState<{
+    username: string;
+    password: string;
+  } | null>(null);
   const [timeRemaining, setTimeRemaining] = useState(0);
   const [customerPhone, setCustomerPhone] = useState('');
-  const [customerMac] = useState('A4:B1:C2:D3:E4:F5');
   const [paymentMethod, setPaymentMethod] = useState<'mobile_money' | 'card' | 'voucher'>('mobile_money');
   const [voucherCode, setVoucherCode] = useState('');
 
@@ -54,7 +64,10 @@ export default function CaptivePortal({ tenant }: CaptivePortalProps) {
 
   const handlePayment = async () => {
     if (paymentMethod !== 'mobile_money') { toast('M-Pesa is the only connected payment method currently', 'warning'); return; }
-    if (!/^2547\d{8}$/.test(customerPhone)) { toast('Enter a valid phone number in the format 2547XXXXXXXX', 'error'); return; }
+    if (!/^(?:\+?254[17]\d{8}|0[17]\d{8}|[17]\d{8})$/.test(customerPhone.trim().replace(/[\s()-]/g, ''))) {
+      toast('Enter a valid Kenyan mobile number, such as 0712345678', 'error');
+      return;
+    }
     if (!selectedPlan) return;
     setProcessing(true);
     setStage('processing');
@@ -62,18 +75,54 @@ export default function CaptivePortal({ tenant }: CaptivePortalProps) {
       const routers = await api.getRouters(tenant.id);
       const router = routers.find((item) => item.is_online) || routers[0];
       if (!router) throw new Error('No router is configured for this venue');
-      const payment = await api.initiateMpesaStkPush({ nas_id: router.id, plan_id: selectedPlan.id, phone_number: customerPhone, mac_address: customerMac });
-      let status = await api.getTransactionStatus(payment.checkout_request_id);
-      for (let attempt = 0; attempt < 30 && status.status === 'PENDING'; attempt += 1) {
+      const payment = await api.initiatePaystackMobileMoney({
+        tenant_id: tenant.id,
+        nas_id: router.id,
+        plan_id: selectedPlan.id,
+        phone_number: customerPhone.trim(),
+        ...(customerMac ? { mac_address: customerMac } : {}),
+      });
+      let paymentStatus: string | null = null;
+      let completedPayment: Awaited<ReturnType<typeof api.getTransactionStatus>> | null = null;
+      for (let attempt = 0; attempt < 30; attempt += 1) {
         await new Promise((resolve) => setTimeout(resolve, 2000));
-        status = await api.getTransactionStatus(payment.checkout_request_id);
+        try {
+          const result = await api.getTransactionStatus(payment.checkout_request_id);
+          paymentStatus = result.status;
+          if (paymentStatus === 'COMPLETED' || paymentStatus === 'completed'
+            || paymentStatus === 'FAILED' || paymentStatus === 'failed') {
+            if (paymentStatus === 'COMPLETED' || paymentStatus === 'completed') {
+              completedPayment = result;
+            }
+            break;
+          }
+        } catch {
+          // Keep waiting through transient status-query errors.
+        }
       }
-      if (status.status !== 'COMPLETED') throw new Error(status.status === 'FAILED' ? 'M-Pesa payment failed or was cancelled' : 'Payment confirmation timed out');
-      setSessionToken(generateSessionToken());
+      if (paymentStatus !== 'COMPLETED' && paymentStatus !== 'completed') {
+        throw new Error(paymentStatus === 'FAILED' || paymentStatus === 'failed'
+          ? 'M-Pesa payment failed or was cancelled'
+          : 'Payment confirmation timed out. Check your M-Pesa messages before retrying.');
+      }
+      const credentials = completedPayment?.hotspot_username && completedPayment.hotspot_password
+        ? {
+          username: completedPayment.hotspot_username,
+          password: completedPayment.hotspot_password,
+        }
+        : null;
+      setHotspotCredentials(credentials);
       setTimeRemaining(selectedPlan.duration_minutes * 60);
       setProcessing(false); setStage('active');
       toast('Payment confirmed. Connecting you to Wi-Fi.');
-      window.location.href = `http://${router.nasname}/login?username=${encodeURIComponent(customerMac)}&password=${encodeURIComponent(customerMac)}`;
+
+      if (credentials && hotspotLoginUrl) {
+        try {
+          submitHotspotLogin(hotspotLoginUrl, hotspotDestination, credentials);
+        } catch {
+          toast('Payment is confirmed, but automatic hotspot login could not start. Use the credentials below.', 'warning');
+        }
+      }
     } catch (error) {
       setProcessing(false); setStage('checkout');
       toast(error instanceof Error ? error.message : 'Payment could not be completed', 'error');
@@ -85,7 +134,7 @@ export default function CaptivePortal({ tenant }: CaptivePortalProps) {
     setSelectedPlan(null);
     setCustomerPhone('');
     setVoucherCode('');
-    setSessionToken('');
+    setHotspotCredentials(null);
     setTimeRemaining(0);
   };
 
@@ -203,7 +252,7 @@ export default function CaptivePortal({ tenant }: CaptivePortalProps) {
                       placeholder="+254 712 345 678"
                       className="w-full rounded-xl border border-white/10 bg-white/5 px-4 py-2.5 text-sm text-white placeholder-zinc-600 focus:border-indigo-500/50 focus:outline-none focus:ring-1 focus:ring-indigo-500/30"
                     />
-                    <p className="mt-1 text-[10px] text-zinc-600 font-mono">MAC: {customerMac}</p>
+                    <p className="mt-1 text-[10px] text-zinc-600 font-mono">MAC: {customerMac || 'Not detected'}</p>
                   </div>
 
                   <div>
@@ -274,8 +323,8 @@ export default function CaptivePortal({ tenant }: CaptivePortalProps) {
                     <div className="flex h-16 w-16 items-center justify-center rounded-full" style={{ background: `${brandColor}20` }}>
                       <CheckCircle2 className="h-8 w-8" style={{ color: brandColor }} />
                     </div>
-                    <p className="mt-3 text-base font-bold text-white">Internet Access Granted</p>
-                    <p className="mt-0.5 text-xs text-zinc-500">You are now connected</p>
+                    <p className="mt-3 text-base font-bold text-white">Payment Confirmed</p>
+                    <p className="mt-0.5 text-xs text-zinc-500">Sign in to activate your Wi-Fi session</p>
                   </div>
 
                   <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
@@ -316,8 +365,17 @@ export default function CaptivePortal({ tenant }: CaptivePortalProps) {
                   </div>
 
                   <div className="rounded-xl border border-white/10 bg-black/30 p-3">
-                    <p className="text-[10px] text-zinc-600">Session Token</p>
-                    <p className="mt-0.5 font-mono text-xs text-zinc-400 break-all">{sessionToken}</p>
+                    <p className="text-[10px] text-zinc-600">Hotspot Login</p>
+                    {hotspotCredentials ? (
+                      <div className="mt-1 space-y-1 font-mono text-xs text-zinc-300">
+                        <p>Username: {hotspotCredentials.username}</p>
+                        <p>Password: {hotspotCredentials.password}</p>
+                      </div>
+                    ) : (
+                      <p className="mt-1 text-xs text-amber-400">
+                        Payment is confirmed, but login credentials are not available yet. Contact the venue for help.
+                      </p>
+                    )}
                   </div>
 
                   <button

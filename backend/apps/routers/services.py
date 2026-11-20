@@ -5,76 +5,443 @@ import os
 import socket
 from datetime import datetime
 
+from django.conf import settings
+from django.db import OperationalError
 from django.utils import timezone
+from django.dispatch import Signal
 
 from .models import NAS
 
 logger = logging.getLogger(__name__)
+router_status_changed = Signal()
 
 try:  # pragma: no cover - optional dependency for direct MikroTik API use
+    import routeros_api
     from routeros_api import RouterOsApiPool  # type: ignore
+    from routeros_api.exceptions import (  # type: ignore
+        RouterOsApiCommunicationError,
+        RouterOsApiConnectionError,
+    )
+    _ROUTEROS_API_AVAILABLE = True
 except Exception:  # pragma: no cover - optional dependency not installed in this environment
+    routeros_api = None
     RouterOsApiPool = None
+    RouterOsApiCommunicationError = Exception  # type: ignore[assignment, misc]
+    RouterOsApiConnectionError = Exception  # type: ignore[assignment, misc]
+    _ROUTEROS_API_AVAILABLE = False
 
 try:  # pragma: no cover - optional dependency
     from librouteros import connect as librouteros_connect  # type: ignore
 except Exception:  # pragma: no cover - dependency is not installed locally
     librouteros_connect = None
 
+try:  # pragma: no cover - optional dependency
+    from librouteros.exceptions import LibRouterosError, TrapError  # type: ignore
+
+    _LIBROUTEROS_EXCEPTIONS = (LibRouterosError, TrapError)
+except Exception:  # pragma: no cover - dependency is not installed locally
+    _LIBROUTEROS_EXCEPTIONS = ()
+
 
 def _credential_value(value: object) -> str:
-    """Return a usable credential, decrypting Fernet values when configured."""
+    """Decrypt a configured Fernet credential or use its stored plain-text value."""
     raw = str(value or '').strip()
     if not raw:
         return ''
-    encryption_key = os.environ.get('CREDENTIAL_ENCRYPTION_KEY', '').strip()
-    if encryption_key:
-        try:
-            from cryptography.fernet import Fernet
-            return Fernet(encryption_key.encode()).decrypt(raw.encode()).decode().strip()
-        except Exception:
-            logger.warning('Stored router credential could not be decrypted; using it as plaintext')
-    return raw
+    if not raw.startswith('gAAAA'):
+        return raw
+
+    encryption_key = (
+        os.environ.get('CREDENTIAL_ENCRYPTION_KEY', '').strip()
+        or settings.CREDENTIAL_ENCRYPTION_KEY
+    )
+    try:
+        from cryptography.fernet import Fernet
+        return Fernet(encryption_key.encode()).decrypt(raw.encode()).decode().strip()
+    except Exception:
+        logger.warning('Stored encrypted router credential could not be decrypted; using it as plaintext')
+        return raw
 
 
 def resolve_router_credentials(router, api_username: object = None, api_password: object = None) -> tuple[str, str]:
-    api_user = _credential_value(api_username if api_username is not None else router.api_username)
-    api_pass = _credential_value(api_password if api_password is not None else router.api_password)
+    api_user = str(api_username).strip() if api_username is not None else _credential_value(router.api_username)
+    api_pass = str(api_password).strip() if api_password is not None else _credential_value(router.api_password)
     return api_user, api_pass
 
 
-def fetch_router_telemetry(router) -> dict:
-    if librouteros_connect is None:
-        raise RouterConnectionError('librouteros is required for router telemetry.', 'LIBROUTEROS_UNAVAILABLE')
-
-    username, password = resolve_router_credentials(router)
+def check_router_status(router, *, timeout: float = 5.0) -> dict:
+    """Authenticate to a router and persist its current connection status."""
+    host = str(getattr(router, 'nas_ip', None) or getattr(router, 'nasname', None) or '').strip()
+    was_online = bool(router.is_online)
+    previous_last_seen = router.last_seen
+    previous_last_ping = router.last_ping
+    error = ''
     connection = None
+
     try:
+        if not host:
+            raise ValueError('No router IP or hostname is configured.')
+        if librouteros_connect is None:
+            raise RuntimeError('The librouteros client is unavailable.')
+
+        username, password = resolve_router_credentials(router)
+        if not username or not password:
+            raise ValueError('Router API credentials are not configured.')
+
         connection = librouteros_connect(
-            host=str(router.nas_ip or router.nasname).strip(),
-            username=username or 'netpulse_admin',
-            password=password or '123',
+            host=host,
+            username=username,
+            password=password,
             port=int(router.api_port or 8728),
+            timeout=timeout,
         )
-        interfaces = list(connection.path('/interface').select('name', 'rx-byte', 'tx-byte'))
-        if not interfaces:
-            return {'rx_bytes': 0, 'tx_bytes': 0, 'interface': 'unknown'}
-        interface = max(
-            interfaces,
-            key=lambda item: int(item.get('rx-byte', 0)) + int(item.get('tx-byte', 0)),
-        )
-        return {
-            'rx_bytes': int(interface.get('rx-byte', 0)),
-            'tx_bytes': int(interface.get('tx-byte', 0)),
-            'interface': interface.get('name', 'unknown'),
-        }
-    except (ValueError, TypeError) as exc:
-        raise RouterConnectionError(f'Invalid RouterOS interface statistics: {exc}', 'TELEMETRY_INVALID') from exc
+        list(connection.path('system', 'resource')('print'))
+        is_online = True
     except Exception as exc:
-        raise RouterConnectionError(f'RouterOS telemetry request failed: {exc}', 'TELEMETRY_FAILED') from exc
+        is_online = False
+        error = str(exc)
     finally:
         if connection is not None and hasattr(connection, 'close'):
-            connection.close()
+            try:
+                connection.close()
+            except Exception:
+                logger.debug('Failed to close RouterOS health-check connection for %s', host, exc_info=True)
+
+    previous_status = 'online' if was_online else 'offline'
+    status_value = 'online' if is_online else 'offline'
+    update_fields = []
+    if router.is_online != is_online:
+        router.is_online = is_online
+        update_fields.append('is_online')
+    if router.status != status_value:
+        router.status = status_value
+        update_fields.append('status')
+
+    if is_online:
+        checked_at = timezone.now()
+        router.last_seen = checked_at
+        router.last_ping = checked_at
+        update_fields.extend(('last_seen', 'last_ping'))
+    if update_fields:
+        update_fields.append('updated_at')
+        try:
+            router.save(update_fields=list(dict.fromkeys(update_fields)))
+        except OperationalError as exc:
+            logger.warning(
+                'Router status could not be saved for NAS %s (%s): %s',
+                getattr(router, 'pk', '?'),
+                host,
+                exc,
+            )
+            router.is_online = was_online
+            router.status = previous_status
+            router.last_seen = previous_last_seen
+            router.last_ping = previous_last_ping
+            return {
+                'is_online': was_online,
+                'status': previous_status,
+                'error': str(exc),
+                'last_seen': previous_last_seen,
+                'last_ping': previous_last_ping,
+            }
+
+    if is_online and not was_online:
+        router_status_changed.send(
+            sender=NAS,
+            router=router,
+            previous_status=previous_status,
+            status=status_value,
+        )
+
+    if is_online:
+        logger.info('Router %s is ONLINE', host)
+    else:
+        logger.warning('Router %s is OFFLINE: %s', host, error)
+    return {
+        'is_online': is_online,
+        'status': status_value,
+        'error': error,
+        'last_seen': router.last_seen,
+        'last_ping': router.last_ping,
+    }
+
+
+def fetch_router_telemetry(router=None, *, host: str | None = None, username: str | None = None, password: str | None = None, port: int | None = None) -> dict:
+    """
+    Fetch telemetry statistics from a MikroTik router.
+
+    Uses RouterOsApiPool (routeros_api) when available, with:
+      plaintext_login=True  – required for RouterOS v7+ API authentication.
+      socket_timeout=3.0    – fast failure on unreachable endpoints.
+      port=8728             – standard unencrypted MikroTik API port.
+
+    Falls back to librouteros if routeros_api is unavailable.
+    All error paths call pool.disconnect() in a finally block so sockets
+    are always released (prevents hitting RouterOS max-sessions=20 limit).
+    All error paths return HTTP-200-safe JSON so the React polling loop
+    never enters an error state on transient failures.
+    """
+    if isinstance(router, str):
+        target_host = router.strip()
+        target_user = username
+        target_pass = password
+        target_port = int(port or 8728)
+    elif router is not None:
+        target_host = str(getattr(router, 'nas_ip', None) or getattr(router, 'nasname', None) or '').strip()
+        resolved_user, resolved_pass = resolve_router_credentials(router)
+        target_user = username or resolved_user
+        target_pass = password or resolved_pass
+        target_port = int(port or getattr(router, 'api_port', None) or 8728)
+    else:
+        target_host = ''
+        target_user = username
+        target_pass = password
+        target_port = int(port or 8728)
+
+    # Ensure credentials are provided
+    if not target_user or not target_pass:
+        raise ValueError("Router credentials must be provided either via DB or caller arguments.")
+
+    target_host = (host or target_host or '192.168.56.20').strip()
+
+    # Strip any stray whitespace from credentials before connecting.
+    # resolve_router_credentials already strips via _credential_value,
+    # but we do it again here as an explicit safety belt.
+    target_user = target_user.strip()
+    target_pass = target_pass.strip()
+
+    # ------------------------------------------------------------------
+    # Primary path: routeros_api (RouterOS v6 + v7 plaintext login)
+    # ------------------------------------------------------------------
+    if _ROUTEROS_API_AVAILABLE:
+        pool = None
+        try:
+            pool = RouterOsApiPool(
+                target_host,
+                username=target_user,
+                password=target_pass,
+                port=target_port,
+                plaintext_login=True,
+                socket_timeout=3.0,
+            )
+            api = pool.get_api()
+
+            # --- Interfaces ---
+            rx_bytes = 0
+            tx_bytes = 0
+            primary_interface = 'unknown'
+            try:
+                interfaces = api.get_resource('/interface').get()
+                if interfaces:
+                    top = max(
+                        interfaces,
+                        key=lambda item: int(item.get('rx-byte', 0) or 0) + int(item.get('tx-byte', 0) or 0),
+                        default={},
+                    )
+                    rx_bytes = int(top.get('rx-byte', 0) or 0)
+                    tx_bytes = int(top.get('tx-byte', 0) or 0)
+                    primary_interface = top.get('name', 'unknown')
+            except Exception:
+                pass
+
+            # --- System resource ---
+            cpu = 0.0
+            memory = 0.0
+            try:
+                res_list = api.get_resource('/system/resource').get()
+                if res_list:
+                    res = res_list[0]
+                    cpu = float(res.get('cpu-load', 0) or 0)
+                    total_mem = float(res.get('total-memory', 0) or 0)
+                    free_mem = float(res.get('free-memory', 0) or 0)
+                    memory = round(((total_mem - free_mem) / total_mem * 100), 2) if total_mem else 0.0
+            except Exception:
+                pass
+
+            return {
+                'status': 'online',
+                'rx_bytes': rx_bytes,
+                'tx_bytes': tx_bytes,
+                'interface': primary_interface,
+                'cpu': cpu,
+                'memory': memory,
+            }
+
+        except RouterOsApiCommunicationError as exc:
+            logger.warning('[Telemetry Auth Error] Router %s: %s', target_host, exc)
+            return {'status': 'offline', 'detail': 'Authentication or protocol error'}
+        except RouterOsApiConnectionError as exc:
+            logger.warning('[Telemetry Auth Error] Router %s: %s', target_host, exc)
+            return {'status': 'offline', 'detail': 'Authentication or protocol error'}
+        except (socket.timeout, TimeoutError) as exc:
+            logger.warning('[Telemetry Warning] Router %s unreachable (timed out)', target_host)
+            return {'status': 'offline', 'error': str(exc)}
+        except Exception as exc:
+            exc_str = str(exc)
+            if 'timed out' in exc_str.lower() or 'timeout' in exc_str.lower():
+                logger.warning('[Telemetry Warning] Router %s unreachable (timed out)', target_host)
+                return {'status': 'offline', 'error': exc_str}
+            logger.warning('[Telemetry Auth Error] Router %s: %s', target_host, exc_str)
+            return {'status': 'offline', 'detail': 'Authentication or protocol error'}
+        finally:
+            if pool is not None:
+                try:
+                    pool.disconnect()
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # Fallback path: librouteros (no plaintext_login support)
+    # ------------------------------------------------------------------
+    if librouteros_connect is not None:
+        connection = None
+        try:
+            connection = librouteros_connect(
+                host=target_host,
+                username=target_user,
+                password=target_pass,
+                port=target_port,
+            )
+            interfaces = list(connection.path('interface')('print'))
+            resources = list(connection.path('system', 'resource')('print'))
+            resource = resources[0] if resources else {}
+            interface = max(
+                interfaces,
+                key=lambda item: int(item.get('rx-byte', 0) or 0) + int(item.get('tx-byte', 0) or 0),
+                default={},
+            )
+            total_memory = int(resource.get('total-memory') or 0)
+            free_memory = int(resource.get('free-memory') or 0)
+            used_memory = max(total_memory - free_memory, 0)
+            return {
+                'status': 'online',
+                'rx_bytes': int(interface.get('rx-byte', 0) or 0),
+                'tx_bytes': int(interface.get('tx-byte', 0) or 0),
+                'interface': interface.get('name') or 'unknown',
+                'cpu': float(resource.get('cpu-load') or 0),
+                'memory': round(used_memory / total_memory * 100, 2) if total_memory else 0.0,
+                'free_memory_bytes': free_memory,
+                'total_memory_bytes': total_memory,
+                'uptime': str(resource.get('uptime') or ''),
+            }
+        except (socket.timeout, TimeoutError) as exc:
+            logger.warning('[Telemetry Warning] Router %s unreachable (timed out)', target_host)
+            return {'status': 'offline', 'error': str(exc)}
+        except Exception as exc:
+            exc_str = str(exc)
+            logger.warning('[Telemetry Auth Error] Router %s: %s', target_host, exc_str)
+            return {'status': 'offline', 'detail': 'Authentication or protocol error'}
+        finally:
+            if connection is not None and hasattr(connection, 'close'):
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+    logger.warning('[Telemetry Warning] Router %s: no RouterOS API library available', target_host)
+    return {'status': 'offline', 'detail': 'Authentication or protocol error'}
+
+
+def fetch_router_metrics(router) -> dict:
+    """Fetch detailed live metrics for one authorized MikroTik router."""
+    if librouteros_connect is None:
+        raise RouterConnectionError(
+            'The MikroTik API client is unavailable on the server.',
+            'LIBROUTEROS_UNAVAILABLE',
+        )
+
+    host = str(router.nas_ip or '').strip()
+    if not host:
+        raise RouterConnectionError('This router has no management IP configured.', 'ROUTER_IP_MISSING')
+
+    connection = None
+    try:
+        username, password = resolve_router_credentials(router)
+        if not username or not password:
+            raise RouterConnectionError('Router API credentials are not configured.', 'ROUTER_CREDENTIALS_MISSING')
+
+        connection = librouteros_connect(
+            host=host,
+            username=username,
+            password=password,
+            port=int(router.api_port or 8728),
+            timeout=5,
+        )
+        resources = list(connection.path('system', 'resource')('print'))
+        if not resources:
+            raise RouterConnectionError('Router returned no system resource data.', 'ROUTER_METRICS_UNAVAILABLE')
+        resource = resources[0]
+
+        memory_total = int(resource.get('total-memory') or 0)
+        memory_free = int(resource.get('free-memory') or 0)
+        memory_used = max(memory_total - memory_free, 0)
+        interfaces = [
+            {
+                'name': str(item.get('name') or 'unknown'),
+                'rx_bytes': int(item.get('rx-byte') or 0),
+                'tx_bytes': int(item.get('tx-byte') or 0),
+            }
+            for item in connection.path('interface')('print')
+        ]
+        active_users = list(connection.path('ip', 'hotspot', 'active')('print'))
+
+        return {
+            'router_id': str(router.pk),
+            'ip_address': host,
+            'cpu_usage_percent': float(resource.get('cpu-load') or 0),
+            'memory_used_bytes': memory_used,
+            'memory_free_bytes': memory_free,
+            'memory_total_bytes': memory_total,
+            'memory_usage_percent': round(memory_used / memory_total * 100, 2) if memory_total else 0,
+            'uptime': str(resource.get('uptime') or ''),
+            'interfaces': interfaces,
+            'active_hotspot_users': len(active_users),
+            'captured_at': timezone.now().isoformat(),
+        }
+    except RouterConnectionError:
+        raise
+    except _LIBROUTEROS_EXCEPTIONS as exc:
+        logger.error(
+            'RouterOS API error for router %s (%s): %s: %s',
+            router.pk,
+            host,
+            type(exc).__name__,
+            exc,
+        )
+        raise RouterConnectionError(
+            'The router rejected or could not process the metrics request.',
+            'ROUTEROS_API_ERROR',
+        ) from exc
+    except (socket.timeout, TimeoutError) as exc:
+        logger.error(
+            'Router metrics connection failed for router %s (%s): %s: %s',
+            router.pk,
+            host,
+            type(exc).__name__,
+            exc,
+        )
+        raise RouterConnectionError(
+            'The router did not respond before the metrics request timed out.',
+            'ROUTER_METRICS_TIMEOUT',
+        ) from exc
+    except Exception as exc:
+        logger.error(
+            'Router metrics failed for router %s (%s): %s: %s',
+            router.pk,
+            host,
+            type(exc).__name__,
+            exc,
+        )
+        raise RouterConnectionError(
+            'Unable to retrieve live metrics from the router.',
+            'ROUTER_METRICS_FAILED',
+        ) from exc
+    finally:
+        if connection is not None and hasattr(connection, 'close'):
+            try:
+                connection.close()
+            except Exception:
+                logger.warning('Failed to close RouterOS metrics connection for router %s', router.pk, exc_info=True)
 
 
 def ping_router_with_credentials(router, *, api_ip=None, api_port=None, api_username=None, api_password=None) -> tuple[str, int, str, str]:
@@ -105,6 +472,8 @@ def _is_duplicate_routeros_error(exc: Exception) -> bool:
 
 
 def provision_with_librouteros(router, *, host: str, port: int, username: str, password: str, router_name: str, radius_ip: str, radius_secret: str, venue: str) -> dict:
+    from librouteros.query import Key
+
     if librouteros_connect is None:
         raise RouterConnectionError('librouteros is required for structured RouterOS provisioning.', 'LIBROUTEROS_UNAVAILABLE')
 
@@ -130,7 +499,7 @@ def provision_with_librouteros(router, *, host: str, port: int, username: str, p
                     raise
                 logger.warning('RADIUS incoming entry already exists on %s; continuing: %s', host, exc)
 
-        profiles = list(api.path('/ip/hotspot/user/profile').select('.id').where(name='default'))
+        profiles = list(api.path('/ip/hotspot/user/profile').select('.id').where(Key('name') == 'default'))
         if profiles:
             api.path('/ip/hotspot/user/profile').set(**{'.id': profiles[0]['.id'], 'shared-users': '1'})
         else:
@@ -141,7 +510,7 @@ def provision_with_librouteros(router, *, host: str, port: int, username: str, p
                     raise
                 logger.warning('Default hotspot profile already exists on %s; continuing: %s', host, exc)
 
-        hotspot_profiles = list(api.path('/ip/hotspot/profile').select('.id').where(name='default'))
+        hotspot_profiles = list(api.path('/ip/hotspot/profile').select('.id').where(Key('name') == 'default'))
         if hotspot_profiles:
             api.path('/ip/hotspot/profile').set(**{'.id': hotspot_profiles[0]['.id'], 'radius-accounting': 'yes', 'use-radius': 'yes'})
 
@@ -485,9 +854,10 @@ def validate_provisioning_inputs(api_ip: str, api_port: int | str, api_username:
     api_password = str(api_password or '').strip()
     shared_secret = str(shared_secret or '').strip()
     try:
+        ipaddress.ip_address(api_ip)
         ipaddress.ip_address(radius_server_ip)
     except ValueError as exc:
-        raise RouterConnectionError('RADIUS server address must be a valid IP address.', 'INVALID_ADDRESS') from exc
+        raise RouterConnectionError('Router and RADIUS addresses must be valid IP addresses.', 'INVALID_ADDRESS') from exc
     try:
         api_port = int(api_port)
     except (TypeError, ValueError) as exc:

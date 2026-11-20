@@ -24,6 +24,8 @@ class RadiusRouter:
         return None
 
     def allow_migrate(self, db, app_label, model_name=None, **hints):
+        if db == 'radius_db':
+            return app_label in self.route_app_labels
         if app_label in self.route_app_labels:
-            return False  # Prevent Django from running migrations on RADIUS tables
+            return False
         return None

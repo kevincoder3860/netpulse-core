@@ -1,10 +1,10 @@
-from django.urls import re_path
+from django.urls import path
 
 from . import consumers
 
 websocket_urlpatterns = [
-    re_path(
-        r'ws/telemetry/(?P<tenant_id>[^/]+)/$',
+    path(
+        'ws/telemetry/<str:tenant_id>/',
         consumers.TelemetryConsumer.as_asgi(),
     ),
 ]

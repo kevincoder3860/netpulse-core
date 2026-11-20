@@ -42,6 +42,8 @@ dist/
 build/
 .npm
 .yarn
+!/project/src/lib/
+!/project/src/lib/**
 
 # System
 .DS_Store

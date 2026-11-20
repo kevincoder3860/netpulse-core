@@ -4,8 +4,11 @@ from datetime import datetime
 import logging
 
 import psutil
+from django.db import OperationalError
 from django.db.models import Sum, Count, Max
+from django.core.cache import cache
 from django.utils import timezone
+from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -17,47 +20,57 @@ from .models import ClientActivity, TrafficSample
 
 logger = logging.getLogger(__name__)
 
-try:
-    from librouteros import connect as routeros_connect
-except Exception:  # pragma: no cover - optional at import time
-    routeros_connect = None
+ROUTER_TELEMETRY_CACHE_SECONDS = 15
 
 
 def _router_telemetry(router):
-    if routeros_connect is None:
-        return {'cpu': 0.0, 'memory': 0.0, 'tx_bytes': 0, 'rx_bytes': 0, 'interface': 'unknown'}
-    connection = None
+    """
+    Fetch live telemetry for a single NAS router.
+
+    Delegates to fetch_router_telemetry (telemetry app) which uses
+    routeros_api with plaintext_login=True (RouterOS v7+), a 5-second
+    socket timeout, and a guaranteed pool.disconnect() in its finally block.
+
+    Returns a dict with keys: cpu, memory, tx_bytes, rx_bytes, interface.
+    On failure (auth error, timeout, offline) returns safe zero-valued defaults
+    so callers never need to handle None.
+    """
+    cache_key = (
+        f'router-telemetry-v1:{router.pk}:'
+        f'{getattr(router, "nas_ip", "")}:{getattr(router, "api_port", "")}'
+    )
     try:
-        connection = routeros_connect(
-            host=router.nas_ip,
-            username=router.api_username,
-            password=router.api_password,
-            port=router.api_port or 8728,
-        )
-        resource = list(connection.path('/system/resource').select('cpu-load', 'free-memory', 'total-memory'))
-        interfaces = list(connection.path('/interface').select('name', 'rx-byte', 'tx-byte'))
-        resource = resource[0] if resource else {}
-        total_memory = float(resource.get('total-memory', 0) or 0)
-        free_memory = float(resource.get('free-memory', 0) or 0)
-        memory = ((total_memory - free_memory) / total_memory * 100) if total_memory else 0.0
-        traffic = max(
-            interfaces,
-            key=lambda item: int(item.get('rx-byte', 0) or 0) + int(item.get('tx-byte', 0) or 0),
-            default={},
-        )
-        return {
-            'cpu': float(resource.get('cpu-load', 0) or 0),
-            'memory': round(memory, 2),
-            'tx_bytes': int(traffic.get('tx-byte', 0) or 0),
-            'rx_bytes': int(traffic.get('rx-byte', 0) or 0),
-            'interface': traffic.get('name', 'unknown') or 'unknown',
-        }
+        cached_sample = cache.get(cache_key)
+    except Exception as exc:
+        logger.warning('Router telemetry cache read failed for NAS %s: %s', router.pk, exc)
+        cached_sample = None
+    if cached_sample is not None:
+        return cached_sample
+
+    try:
+        from apps.telemetry.views import fetch_router_telemetry
+        sample = fetch_router_telemetry(router)
     except Exception as exc:
         logger.warning('Router telemetry failed for NAS %s: %s', router.pk, exc)
-        return {'cpu': 0.0, 'memory': 0.0, 'tx_bytes': 0, 'rx_bytes': 0, 'interface': 'unknown'}
-    finally:
-        if connection is not None and hasattr(connection, 'close'):
-            connection.close()
+        result = {'cpu': 0.0, 'memory': 0.0, 'tx_bytes': 0, 'rx_bytes': 0, 'interface': 'unknown'}
+    else:
+        if sample.get('status') != 'online':
+            result = {'cpu': 0.0, 'memory': 0.0, 'tx_bytes': 0, 'rx_bytes': 0, 'interface': 'unknown'}
+        else:
+            result = {
+                'cpu': float(sample.get('cpu') or 0),
+                'memory': float(sample.get('memory') or 0),
+                'tx_bytes': int(sample.get('tx_bytes') or 0),
+                'rx_bytes': int(sample.get('rx_bytes') or 0),
+                'interface': sample.get('interface') or 'unknown',
+            }
+
+    try:
+        cache.set(cache_key, result, timeout=ROUTER_TELEMETRY_CACHE_SECONDS)
+    except Exception as exc:
+        logger.warning('Router telemetry cache write failed for NAS %s: %s', router.pk, exc)
+    return result
+
 
 
 class TelemetryHealthView(APIView):
@@ -66,7 +79,33 @@ class TelemetryHealthView(APIView):
     def get(self, request):
         tenant = tenant_for_user(request.user)
         tenant_id = request.query_params.get('tenant_id') if request.user.is_superadmin else getattr(tenant, 'id', None)
-        routers = NAS.objects.filter(tenant_id=tenant_id, type='mikrotik', is_online=True) if tenant_id else NAS.objects.none()
+        try:
+            routers = list(
+                NAS.objects.filter(tenant_id=tenant_id, type='mikrotik', is_online=True)
+            ) if tenant_id else []
+            inactive_routers = (
+                NAS.objects.filter(tenant_id=tenant_id, is_online=False).count()
+                if tenant_id else 0
+            )
+            total_routers = NAS.objects.filter(tenant_id=tenant_id).count() if tenant_id else 0
+            now = timezone.now()
+            transactions = Transaction.objects.filter(tenant_id=tenant_id, status='COMPLETED')
+            income_today = transactions.filter(
+                created_at__date=now.date()
+            ).aggregate(total=Sum('gross_amount'))['total'] or Decimal('0.00')
+            income_month = transactions.filter(
+                created_at__year=now.year,
+                created_at__month=now.month,
+            ).aggregate(total=Sum('gross_amount'))['total'] or Decimal('0.00')
+        except OperationalError as exc:
+            is_busy = 'locked' in str(exc).lower() or 'busy' in str(exc).lower()
+            code = 'DATABASE_BUSY' if is_busy else 'DATABASE_UNAVAILABLE'
+            logger.warning('Telemetry database query failed for tenant %s (%s): %s', tenant_id, code, exc)
+            return Response(
+                {'detail': 'Telemetry data is temporarily unavailable.', 'code': code},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
         server_cpu = psutil.cpu_percent(interval=0)
         memory = psutil.virtual_memory().percent
         disk = psutil.disk_usage('/').percent
@@ -81,10 +120,6 @@ class TelemetryHealthView(APIView):
             tx_bytes += sample['tx_bytes']
             rx_bytes += sample['rx_bytes']
 
-        now = timezone.now()
-        transactions = Transaction.objects.filter(tenant_id=tenant_id, status='COMPLETED')
-        income_today = transactions.filter(created_at__date=now.date()).aggregate(total=Sum('gross_amount'))['total'] or Decimal('0.00')
-        income_month = transactions.filter(created_at__year=now.year, created_at__month=now.month).aggregate(total=Sum('gross_amount'))['total'] or Decimal('0.00')
         return Response({
             'server_cpu': round(server_cpu, 2),
             'mikrotik_cpu': round(router_cpu, 2),
@@ -94,9 +129,9 @@ class TelemetryHealthView(APIView):
             'income_today': float(income_today),
             'income_month': float(income_month),
             'hotspot_status': {
-                'active': routers.count(),
-                'inactive': NAS.objects.filter(tenant_id=tenant_id, is_online=False).count() if tenant_id else 0,
-                'total': NAS.objects.filter(tenant_id=tenant_id).count() if tenant_id else 0,
+                'active': len(routers),
+                'inactive': inactive_routers,
+                'total': total_routers,
             },
             'traffic': {
                 'tx_kbps': round(tx_bytes / 1024, 2),

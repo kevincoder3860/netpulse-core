@@ -23,6 +23,7 @@ class NAS(models.Model):
     is_online = models.BooleanField(default=False)
     status = models.CharField(max_length=16, choices=(('online', 'Online'), ('offline', 'Offline')), default='offline')
     last_ping = models.DateTimeField(null=True, blank=True)
+    last_seen = models.DateTimeField(null=True, blank=True)
     last_provisioned_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

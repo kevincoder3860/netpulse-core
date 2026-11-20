@@ -5,12 +5,10 @@ import type {
   SystemUser, PlatformSettings
 } from '@/lib/types';
 import { jwtDecode } from 'jwt-decode';
+import { API_BASE_URL, API_FALLBACK_ROOT, API_TOKEN_ROOT } from '@/lib/config';
 
-const configuredApiRoot = import.meta.env.VITE_API_BASE_URL?.trim();
-const API_BASE_URL = configuredApiRoot || 'http://localhost:8000/api/v1';
-const API_ROOT = API_BASE_URL.replace(/\/+$/, '');
-const API_FALLBACK_ROOT = 'http://127.0.0.1:8000/api/v1';
-const TOKEN_ROOT = import.meta.env.VITE_API_TOKEN_URL || `${API_ROOT}/auth`;
+const API_ROOT = API_BASE_URL;
+const TOKEN_ROOT = API_TOKEN_ROOT;
 
 export interface PortalConfig {
   business_name: string;
@@ -190,7 +188,7 @@ export const api = {
       return data;
     } catch (error) {
       if (axios.isAxiosError(error) && !error.response) {
-        const offlineMessage = 'The API server is offline or unreachable. Please ensure the backend is running on http://localhost:8000 and try again.';
+        const offlineMessage = `The API server at ${API_BASE_URL} is offline or unreachable. Please check your connection and try again.`;
         alert(offlineMessage);
         throw new Error(offlineMessage);
       }

@@ -1,33 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { TelemetryHealth } from '@/lib/api';
+import { resolveWebSocketBaseUrl } from '@/lib/config';
 
 const MAX_TRAFFIC_SAMPLES = 20;
 const INITIAL_BACKOFF_MS = 2000;
 const MAX_BACKOFF_MS = 30000;
 const RAPID_CLOSE_MS = 2500;
 
-function resolveWsBaseUrl(): string {
-  const configured = import.meta.env.VITE_WS_BASE_URL?.trim();
-  if (configured) {
-    return configured.replace(/\/+$/, '');
-  }
-
-  const apiRoot = (import.meta.env.VITE_API_BASE_URL?.trim() || 'http://127.0.0.1:8000/api/v1')
-    .replace(/\/+$/, '')
-    .replace(/\/api\/v1$/i, '');
-
-  try {
-    const url = new URL(apiRoot);
-    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-    return url.origin;
-  } catch {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${protocol}//${window.location.hostname}:8000`;
-  }
-}
-
 function buildTelemetryUrl(tenantId: string, token: string | null): string {
-  const base = resolveWsBaseUrl();
+  const base = resolveWebSocketBaseUrl();
   const path = `/ws/telemetry/${encodeURIComponent(tenantId)}/`;
   const url = new URL(path, `${base}/`);
   if (token) {

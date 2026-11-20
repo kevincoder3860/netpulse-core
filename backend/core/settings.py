@@ -177,24 +177,31 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # CORS configuration
 CORS_ALLOW_ALL_ORIGINS = False
 CORS_ALLOW_CREDENTIALS = True
-cors_origins = os.getenv('CORS_ALLOWED_ORIGINS')
-if cors_origins:
-    CORS_ALLOWED_ORIGINS = [origin.strip() for origin in cors_origins.split(',') if origin.strip()]
-else:
-    CORS_ALLOWED_ORIGINS = [
-        'http://localhost:5173',
-        'http://127.0.0.1:5173',
-        'http://192.168.1.107:5173',
-        'http://192.168.1.107:8001',
-        'http://localhost:8000',
-        'http://127.0.0.1:8000',
-    ]
+CORS_ALLOWED_ORIGINS = list(dict.fromkeys([
+    'https://netpulse-backend-i9fv.onrender.com',
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'http://192.168.1.107:5173',
+    'http://192.168.1.107:8001',
+    'http://localhost:8000',
+    'http://127.0.0.1:8000',
+    *env_list('CORS_ALLOWED_ORIGINS'),
+]))
 CORS_ALLOWED_METHODS = ['DELETE', 'GET', 'OPTIONS', 'PATCH', 'POST', 'PUT']
 CORS_ALLOW_HEADERS = ['*']
-CSRF_TRUSTED_ORIGINS = env_list(
-    'CSRF_TRUSTED_ORIGINS',
-    'http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,http://192.168.1.107:5173,http://192.168.1.107:5174,http://192.168.100.8:5173,http://192.168.100.8:8001,http://localhost:8000,http://127.0.0.1:8000',
-)
+CSRF_TRUSTED_ORIGINS = list(dict.fromkeys([
+    'https://netpulse-backend-i9fv.onrender.com',
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'http://127.0.0.1:5173',
+    'http://192.168.1.107:5173',
+    'http://192.168.1.107:5174',
+    'http://192.168.100.8:5173',
+    'http://192.168.100.8:8001',
+    'http://localhost:8000',
+    'http://127.0.0.1:8000',
+    *env_list('CSRF_TRUSTED_ORIGINS'),
+]))
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (

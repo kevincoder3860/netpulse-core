@@ -32,7 +32,7 @@ function roleForClaims(): Role {
 
 function AuthScreen({ onAuthenticated }: { onAuthenticated: () => void }) {
   const [mode, setMode] = useState<'login' | 'register'>('login');
-  const [username, setUsername] = useState('');
+  const [loginIdentifier, setLoginIdentifier] = useState('');
   const [email, setEmail] = useState('');
   const [businessName, setBusinessName] = useState('');
   const [phoneNumber, setPhoneNumber] = useState('');
@@ -48,7 +48,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: () => void }) {
       if (mode === 'register') {
         await api.register({ email, password, business_name: businessName, phone_number: phoneNumber });
       } else {
-        await api.signIn(username, password);
+        await api.signIn(loginIdentifier, password);
       }
       onAuthenticated();
     } catch (err) {
@@ -80,7 +80,7 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: () => void }) {
               <input required type="tel" value={phoneNumber} onChange={(e) => setPhoneNumber(e.target.value)} placeholder="Phone number (254...)" className="w-full rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-white outline-none focus:border-cyan-300/50" />
             </>
           )}
-          {mode === 'login' && <input required value={username} onChange={(e) => setUsername(e.target.value)} placeholder="Username" className="w-full rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-white outline-none focus:border-cyan-300/50" />}
+          {mode === 'login' && <input required value={loginIdentifier} onChange={(e) => setLoginIdentifier(e.target.value)} placeholder="Email or username" className="w-full rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-white outline-none focus:border-cyan-300/50" />}
           <input required minLength={8} type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" className="w-full rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-white outline-none focus:border-cyan-300/50" />
         </div>
         {error && <div className={`mt-4 rounded-xl border px-4 py-3 text-sm ${/suspended|closed/i.test(error) ? 'border-amber-300/20 bg-amber-300/10 text-amber-200' : 'border-rose-300/20 bg-rose-300/10 text-rose-200'}`}>{error}</div>}

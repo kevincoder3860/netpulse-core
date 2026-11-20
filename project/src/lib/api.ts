@@ -164,13 +164,13 @@ function apiErrorMessage(error: unknown, fallback: string) {
   };
 
   const detail = formatResponseData(error.response?.data);
-  return detail || error.message || fallback;
+  return detail || (error.response ? fallback : error.message || fallback);
 }
 
 export const api = {
-  async signIn(username: string, password: string) {
+  async signIn(identifier: string, password: string) {
     try {
-      const postLogin = (root: string) => axios.post<{ access: string; refresh: string }>(`${root}/login/`, { username, password });
+      const postLogin = (root: string) => axios.post<{ access: string; refresh: string }>(`${root}/login/`, { username: identifier, password });
       let data: { access: string; refresh: string };
       try {
         ({ data } = await postLogin(TOKEN_ROOT));
@@ -182,8 +182,24 @@ export const api = {
       localStorage.setItem('np_refresh', data.refresh);
       return data;
     } catch (error) {
-      const detail = axios.isAxiosError(error) ? error.response?.data?.detail : null;
-      throw new Error(detail || 'Unable to sign in. Check your credentials.');
+      if (!axios.isAxiosError(error)) throw error;
+      if (error.response?.status === 401) {
+        const detail = apiErrorMessage(error, '');
+        throw new Error(detail
+          ? `Invalid email/username or password. ${detail}`
+          : 'Invalid email/username or password.');
+      }
+      if (error.response) {
+        const detail = apiErrorMessage(error, 'The server did not provide additional error details.');
+        throw new Error(`Sign-in failed (HTTP ${error.response.status}): ${detail}`);
+      }
+      if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+        throw new Error(`The sign-in request to ${API_BASE_URL} timed out. Please try again.`);
+      }
+      if (error.code === 'ERR_NETWORK') {
+        throw new Error(`Could not connect to the API at ${API_BASE_URL}. Check your network connection and try again.`);
+      }
+      throw new Error(error.message || 'Unable to sign in.');
     }
   },
   register: async (payload: {
